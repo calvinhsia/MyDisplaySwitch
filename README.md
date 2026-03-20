@@ -4,6 +4,15 @@ A Windows command-line utility for switching display configurations using the [C
 
 Useful for quickly toggling between a single-monitor setup and a multi-monitor extended desktop — especially via a Start Menu shortcut or keyboard hotkey.
 
+On my adjustable height desk, I have a laptop with two external monitors on monitor arms. Normally, I have the laptop screen as the main display (with the taskbar).
+When I ride my exercise bike daily, I can raise the desk and turn the right external monitor on its arm to face the bike so I can view the screen and use my external wireless mouse/keyboard/earbuds while riding.
+For years, this worked fine. I could set the screen content and be very careful while riding, knowing that e.g. alt-tab would show on the screen I couldn't see, and that I had no access to the task bar.
+
+With this utility, I can quickly toggle between all displays (in my normal work mode) and only the right most display being used (exercise mode) with a single Windows shortcut,
+without fiddling with the Windows display settings. 
+I know the Windows key + P shortcut allows to switch between display modes, but it doesn't allow me to specify which monitor to use.
+Now while exercising I have full access to the taskbar and can move my mouse and alt-tab on the bike without worrying about which screen is active.
+
 ## Requirements
 
 - Windows 10/11

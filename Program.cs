@@ -28,7 +28,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 
-public static class CcdDisplaySwitcher
+public class CcdDisplaySwitcher
 {
     // QueryDisplayConfig flags
     private const uint QDC_ALL_PATHS = 0x00000001;
@@ -218,7 +218,7 @@ public static class CcdDisplaySwitcher
 
     // ---- Public helpers ----
 
-    public static void ListTargets()
+    public void ListTargets()
     {
         var (paths, modes) = GetConfig(QDC_ALL_PATHS);
 
@@ -237,7 +237,7 @@ public static class CcdDisplaySwitcher
     /// If 1 active monitor: enable all extended and make "UID83" (laptop UID8388688) the primary.
     /// Ideal for a Start Menu shortcut or hotkey — see top-of-file comments for setup instructions.
     /// </summary>
-    public static void Toggle()
+    public void Toggle()
     {
         var (activePaths, _) = GetConfig(QDC_ONLY_ACTIVE_PATHS);
         int activeCount = activePaths.Length;
@@ -260,7 +260,7 @@ public static class CcdDisplaySwitcher
     /// Enable only targets whose friendly name contains <paramref name="friendlyNameSubstring"/> (case-insensitive).
     /// Disables all other active paths.
     /// </summary>
-    public static void EnableOnly(string friendlyNameSubstring)
+    public void EnableOnly(string friendlyNameSubstring)
     {
         // Ensure all connected displays are active so we can find them all
         EnableAllExtended();
@@ -308,7 +308,7 @@ public static class CcdDisplaySwitcher
     /// Step 1: enter extend mode via the topology database (may not include all monitors).
     /// Step 2: detect any missing connected targets and add them with cloned mode data.
     /// </summary>
-    public static void EnableAllExtended()
+    public void EnableAllExtended()
     {
         // Step 1 – enter extend mode from the database (works even if not all monitors are included)
         int rc = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
@@ -427,7 +427,7 @@ public static class CcdDisplaySwitcher
     /// Set the primary display to the one whose device path contains <paramref name="devicePathSubstring"/>.
     /// The primary display is the one whose source mode position is (0,0).
     /// </summary>
-    public static void SetPrimary(string devicePathSubstring)
+    public void SetPrimary(string devicePathSubstring)
     {
         var (paths, modes) = GetConfig(QDC_ONLY_ACTIVE_PATHS);
 
@@ -471,7 +471,7 @@ public static class CcdDisplaySwitcher
 
     // ---- Internal plumbing ----
 
-    private static (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) GetConfig(uint qdcFlags)
+    private (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) GetConfig(uint qdcFlags)
     {
         int rc = GetDisplayConfigBufferSizes(qdcFlags, out uint pathCount, out uint modeCount);
         if (rc != 0) throw new System.ComponentModel.Win32Exception(rc);
@@ -503,7 +503,7 @@ public static class CcdDisplaySwitcher
         }
     }
 
-    private static bool TryGetTargetName(LUID adapterId, uint targetId, out DISPLAYCONFIG_TARGET_DEVICE_NAME result)
+    private bool TryGetTargetName(LUID adapterId, uint targetId, out DISPLAYCONFIG_TARGET_DEVICE_NAME result)
     {
         result = new DISPLAYCONFIG_TARGET_DEVICE_NAME
         {
@@ -522,7 +522,7 @@ public static class CcdDisplaySwitcher
         return rc == 0;
     }
 
-    private static void Log(string message)
+    private void Log(string message)
     {
         Trace.WriteLine(message);
         Console.WriteLine(message);
@@ -532,7 +532,7 @@ public static class CcdDisplaySwitcher
     /// Shift all source mode positions so that the top-left of the active desktop is at (0,0).
     /// MSDN requires (0,0) to be covered by at least one active source.
     /// </summary>
-    private static void NormalizeSourcePositions(DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
+    private void NormalizeSourcePositions(DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
     {
         int minX = int.MaxValue, minY = int.MaxValue;
         for (int i = 0; i < paths.Length; i++)
@@ -557,7 +557,7 @@ public static class CcdDisplaySwitcher
         }
     }
 
-    private static void DumpConfig(string label, DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
+    private void DumpConfig(string label, DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
     {
         Log($"\n=== {label} === paths={paths.Length} modes={modes.Length}");
         for (int i = 0; i < paths.Length; i++)
@@ -593,7 +593,7 @@ public static class CcdDisplaySwitcher
         }
     }
 
-    private static void ApplySuppliedConfig(DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
+    private void ApplySuppliedConfig(DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
     {
         var hPaths = GCHandle.Alloc(paths, GCHandleType.Pinned);
         var hModes = GCHandle.Alloc(modes, GCHandleType.Pinned);
@@ -622,7 +622,7 @@ public static class CcdDisplaySwitcher
             hModes.Free();
         }
     }
-    public static void EnableOnlyByTargetDevicePathSubstring(string needle)
+    public void EnableOnlyByTargetDevicePathSubstring(string needle)
     {
         // Ensure all connected displays are active so we can find them all
         EnableAllExtended();
@@ -664,7 +664,7 @@ public static class CcdDisplaySwitcher
         NormalizeSourcePositions(paths, modes);
         ApplySuppliedConfig(paths, modes);
     }
-    private static void PrintUsage()
+    private void PrintUsage()
     {
         Console.WriteLine("Usage: MyDisplaySwitch <command> [args]");
         Console.WriteLine();
@@ -697,9 +697,10 @@ Targets:
      */
     public static int Main(string[] args)
     {
+        var switcher = new CcdDisplaySwitcher();
         if (args.Length == 0)
         {
-            PrintUsage();
+            switcher.PrintUsage();
             return 1;
         }
 
@@ -708,26 +709,26 @@ Targets:
             switch (args[0].ToLowerInvariant())
             {
                 case "list":
-                    ListTargets();
+                    switcher.ListTargets();
                     break;
 
                 case "extend":
-                    EnableAllExtended();
+                    switcher.EnableAllExtended();
                     Console.WriteLine("All displays enabled in extended mode.");
                     break;
 
                 case "toggle":
-                    Toggle();
+                    switcher.Toggle();
                     break;
 
                 case "only":
                     if (args.Length < 2)
                     {
                         Console.Error.WriteLine("Error: 'only' requires a device path substring argument.");
-                        PrintUsage();
+                        switcher.PrintUsage();
                         return 1;
                     }
-                    EnableOnlyByTargetDevicePathSubstring(args[1]);
+                    switcher.EnableOnlyByTargetDevicePathSubstring(args[1]);
                     Console.WriteLine($"Enabled only display matching '{args[1]}'.");
                     break;
 
@@ -735,16 +736,16 @@ Targets:
                     if (args.Length < 2)
                     {
                         Console.Error.WriteLine("Error: 'primary' requires a device path substring argument.");
-                        PrintUsage();
+                        switcher.PrintUsage();
                         return 1;
                     }
-                    SetPrimary(args[1]);
+                    switcher.SetPrimary(args[1]);
                     Console.WriteLine($"Set primary display to the one matching '{args[1]}'.");
                     break;
 
                 default:
                     Console.Error.WriteLine($"Unknown command: {args[0]}");
-                    PrintUsage();
+                    switcher.PrintUsage();
                     return 1;
             }
         }
