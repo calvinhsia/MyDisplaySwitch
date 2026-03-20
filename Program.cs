@@ -1,4 +1,29 @@
-﻿using System;
+﻿// ===================================================================================
+// MyDisplaySwitch – Windows CCD display configuration utility
+//
+// To add a "Toggle Displays" shortcut to the Windows Start Menu:
+//
+//   1. Build/publish the project:
+//        dotnet publish -c Release -r win-x64 --self-contained false
+//
+//   2. Open the Start Menu Programs folder:
+//        - Press Win+R, type:  shell:programs   and press Enter
+//        - (This opens %APPDATA%\Microsoft\Windows\Start Menu\Programs)
+//
+//   3. Right-click in the folder → New → Shortcut
+//        - Target:   "C:\repos\MyDisplaySwitch\bin\Release\net10.0\win-x64\publish\MyDisplaySwitch.exe" toggle
+//        - Name:     Toggle Displays
+//
+//   4. (Optional) Set a keyboard shortcut:
+//        - Right-click the shortcut → Properties → Shortcut tab
+//        - Click the "Shortcut key" field and press your desired combo (e.g. Ctrl+Alt+D)
+//        - Set "Run" to "Minimized" to avoid a console flash
+//
+//   5. The shortcut now appears in Start Menu search and can be pinned to Start or Taskbar.
+//
+// ===================================================================================
+
+using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -203,6 +228,31 @@ public static class CcdDisplaySwitcher
             if ((paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE) == 0) continue;
             if (!TryGetTargetName(paths[i].targetInfo.adapterId, paths[i].targetInfo.id, out var name)) continue;
             Console.WriteLine($"  Path#{i}: {name.monitorFriendlyDeviceName}  [{name.monitorDevicePath}]");
+        }
+    }
+
+    /// <summary>
+    /// Toggle between single-monitor and all-monitors modes.
+    /// If 3 active monitors: switch to only the display matching "UID4" (DELL UID4165).
+    /// If 1 active monitor: enable all extended and make "UID83" (laptop UID8388688) the primary.
+    /// Ideal for a Start Menu shortcut or hotkey — see top-of-file comments for setup instructions.
+    /// </summary>
+    public static void Toggle()
+    {
+        var (activePaths, _) = GetConfig(QDC_ONLY_ACTIVE_PATHS);
+        int activeCount = activePaths.Length;
+        Log($"Toggle: {activeCount} active monitor(s)");
+
+        if (activeCount >= 3)
+        {
+            EnableOnlyByTargetDevicePathSubstring("UID4");
+            Console.WriteLine("Toggled to single display (UID4165).");
+        }
+        else
+        {
+            EnableAllExtended();
+            SetPrimary("UID83");
+            Console.WriteLine("Toggled to all displays with UID8388688 as primary.");
         }
     }
 
@@ -475,7 +525,7 @@ public static class CcdDisplaySwitcher
     private static void Log(string message)
     {
         Trace.WriteLine(message);
-        Console.Error.WriteLine(message);
+        Console.WriteLine(message);
     }
 
     /// <summary>
@@ -623,12 +673,20 @@ public static class CcdDisplaySwitcher
         Console.WriteLine("  extend                        Enable all displays in extended mode");
         Console.WriteLine("  only <devicePathSubstring>    Enable only the display whose device path contains the substring");
         Console.WriteLine("  primary <devicePathSubstring> Set the primary display to the one whose device path contains the substring");
+        Console.WriteLine("  toggle                        Toggle between single monitor (UID4165) and all 3 with UID8388688 as primary");
         Console.WriteLine();
         Console.WriteLine("Examples:");
         Console.WriteLine("  MyDisplaySwitch list");
         Console.WriteLine("  MyDisplaySwitch extend");
         Console.WriteLine("  MyDisplaySwitch only UID8517");
         Console.WriteLine("  MyDisplaySwitch primary UID8388688");
+        Console.WriteLine();
+        Console.WriteLine("Start Menu shortcut for 'toggle':");
+        Console.WriteLine("  1. Press Win+R → type 'shell:programs' → Enter");
+        Console.WriteLine("  2. Right-click → New → Shortcut");
+        Console.WriteLine("     Target: \"<path-to>\\MyDisplaySwitch.exe\" toggle");
+        Console.WriteLine("  3. (Optional) Right-click shortcut → Properties → set a Shortcut key (e.g. Ctrl+Alt+D)");
+        Console.WriteLine("     Set 'Run' to 'Minimized' to avoid a console flash.");
 
     }
     /*
@@ -656,6 +714,10 @@ Targets:
                 case "extend":
                     EnableAllExtended();
                     Console.WriteLine("All displays enabled in extended mode.");
+                    break;
+
+                case "toggle":
+                    Toggle();
                     break;
 
                 case "only":
