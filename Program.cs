@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 
@@ -12,6 +13,12 @@ public static class CcdDisplaySwitcher
     private const uint SDC_APPLY = 0x00000080;
     private const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x00000020;
     private const uint SDC_ALLOW_CHANGES = 0x00000400;
+    private const uint SDC_TOPOLOGY_EXTEND = 0x00000004;
+    private const uint SDC_TOPOLOGY_SUPPLIED = 0x00000010;
+
+    // Mode info types
+    private const uint DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
+    private const uint DISPLAYCONFIG_MODE_INFO_TYPE_TARGET = 2;
 
     // Path flags
     private const uint DISPLAYCONFIG_PATH_ACTIVE = 0x00000001;
@@ -205,6 +212,9 @@ public static class CcdDisplaySwitcher
     /// </summary>
     public static void EnableOnly(string friendlyNameSubstring)
     {
+        // Ensure all connected displays are active so we can find them all
+        EnableAllExtended();
+
         var (paths, modes) = GetConfig(QDC_ONLY_ACTIVE_PATHS);
 
         // Decide which paths to keep active based on target friendly name
@@ -238,6 +248,173 @@ public static class CcdDisplaySwitcher
 
         if (!anyKept)
             throw new InvalidOperationException($"No active targets matched '{friendlyNameSubstring}'.");
+
+        NormalizeSourcePositions(paths, modes);
+        ApplySuppliedConfig(paths, modes);
+    }
+
+    /// <summary>
+    /// Enable all connected displays in extended mode.
+    /// Step 1: enter extend mode via the topology database (may not include all monitors).
+    /// Step 2: detect any missing connected targets and add them with cloned mode data.
+    /// </summary>
+    public static void EnableAllExtended()
+    {
+        // Step 1 – enter extend mode from the database (works even if not all monitors are included)
+        int rc = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
+        if (rc != 0) throw new System.ComponentModel.Win32Exception(rc);
+
+        // Step 2 – discover all available targets
+        var (allPaths, _) = GetConfig(QDC_ALL_PATHS);
+        var availableTargets = new System.Collections.Generic.HashSet<(uint low, int high, uint id)>();
+        foreach (var p in allPaths)
+        {
+            if (p.targetInfo.targetAvailable &&
+                TryGetTargetName(p.targetInfo.adapterId, p.targetInfo.id, out _))
+            {
+                availableTargets.Add((p.targetInfo.adapterId.LowPart, p.targetInfo.adapterId.HighPart, p.targetInfo.id));
+            }
+        }
+
+        // Step 3 – get the current active config (has valid mode indices)
+        var (activePaths, activeModes) = GetConfig(QDC_ONLY_ACTIVE_PATHS);
+        var activeTargets = new System.Collections.Generic.HashSet<(uint low, int high, uint id)>();
+        var usedSources = new System.Collections.Generic.HashSet<(uint low, int high, uint id)>();
+        foreach (var p in activePaths)
+        {
+            activeTargets.Add((p.targetInfo.adapterId.LowPart, p.targetInfo.adapterId.HighPart, p.targetInfo.id));
+            usedSources.Add((p.sourceInfo.adapterId.LowPart, p.sourceInfo.adapterId.HighPart, p.sourceInfo.id));
+        }
+
+        var missingTargets = availableTargets.Except(activeTargets).ToList();
+        if (missingTargets.Count == 0) return; // all connected monitors are already active
+
+        // Step 4 – find the right edge of the current desktop and a template for cloning mode data
+        int rightEdge = 0;
+        DISPLAYCONFIG_MODE_INFO templateSourceMode = default;
+        DISPLAYCONFIG_MODE_INFO templateTargetMode = default;
+        bool hasTemplate = false;
+
+        foreach (var p in activePaths)
+        {
+            uint si = p.sourceInfo.modeInfoIdx;
+            uint ti = p.targetInfo.modeInfoIdx;
+            if (si < (uint)activeModes.Length && activeModes[si].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                var sm = activeModes[si].u.sourceMode;
+                int edge = sm.position.x + (int)sm.width;
+                if (edge > rightEdge) rightEdge = edge;
+                if (!hasTemplate) templateSourceMode = activeModes[si];
+            }
+            if (ti < (uint)activeModes.Length && activeModes[ti].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+            {
+                if (!hasTemplate) templateTargetMode = activeModes[ti];
+            }
+            if (si < (uint)activeModes.Length && ti < (uint)activeModes.Length)
+                hasTemplate = true;
+        }
+
+        if (!hasTemplate) return; // no template available – cannot build mode data
+
+        // Step 5 – for each missing target, clone real mode data from the template
+        var pathsList = new System.Collections.Generic.List<DISPLAYCONFIG_PATH_INFO>(activePaths);
+        var modesList = new System.Collections.Generic.List<DISPLAYCONFIG_MODE_INFO>(activeModes);
+
+        foreach (var missing in missingTargets)
+        {
+            foreach (var p in allPaths)
+            {
+                var tk = (p.targetInfo.adapterId.LowPart, p.targetInfo.adapterId.HighPart, p.targetInfo.id);
+                var sk = (p.sourceInfo.adapterId.LowPart, p.sourceInfo.adapterId.HighPart, p.sourceInfo.id);
+
+                if (tk == missing && !usedSources.Contains(sk))
+                {
+                    var newPath = p;
+                    newPath.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+
+                    // Fix potentially invalid enum values on inactive paths
+                    if (newPath.targetInfo.rotation == 0)
+                        newPath.targetInfo.rotation = 1; // DISPLAYCONFIG_ROTATION_IDENTITY
+                    if (newPath.targetInfo.scaling == 0)
+                        newPath.targetInfo.scaling = 1; // DISPLAYCONFIG_SCALING_IDENTITY
+
+                    // Clone source mode from template, placed to the right of existing desktop
+                    var srcMode = templateSourceMode;
+                    srcMode.id = newPath.sourceInfo.id;
+                    srcMode.adapterId = newPath.sourceInfo.adapterId;
+                    srcMode.u.sourceMode.position.x = rightEdge;
+                    srcMode.u.sourceMode.position.y = 0;
+                    newPath.sourceInfo.modeInfoIdx = (uint)modesList.Count;
+                    modesList.Add(srcMode);
+
+                    // Clone target mode from template
+                    var tgtMode = templateTargetMode;
+                    tgtMode.id = newPath.targetInfo.id;
+                    tgtMode.adapterId = newPath.targetInfo.adapterId;
+                    newPath.targetInfo.modeInfoIdx = (uint)modesList.Count;
+                    modesList.Add(tgtMode);
+
+                    rightEdge += (int)srcMode.u.sourceMode.width;
+
+                    pathsList.Add(newPath);
+                    usedSources.Add(sk);
+                    break;
+                }
+            }
+        }
+
+        // Diagnostic: show what we're about to apply
+        Log($"\nEnableAllExtended: {activePaths.Length} active + {missingTargets.Count} missing targets");
+        foreach (var m in missingTargets)
+            Log($"  Missing: adapterId=({m.low},{m.high}) targetId={m.id}");
+
+        // Step 6 – apply with fully populated mode data; SDC_ALLOW_CHANGES adjusts
+        //          cloned modes if the new target's native resolution differs.
+        ApplySuppliedConfig(pathsList.ToArray(), modesList.ToArray());
+    }
+
+    /// <summary>
+    /// Set the primary display to the one whose device path contains <paramref name="devicePathSubstring"/>.
+    /// The primary display is the one whose source mode position is (0,0).
+    /// </summary>
+    public static void SetPrimary(string devicePathSubstring)
+    {
+        var (paths, modes) = GetConfig(QDC_ONLY_ACTIVE_PATHS);
+
+        // Find the source mode index for the target display
+        int primarySourceModeIdx = -1;
+        for (int i = 0; i < paths.Length; i++)
+        {
+            var t = paths[i].targetInfo;
+            if (!TryGetTargetName(t.adapterId, t.id, out var name)) continue;
+
+            if (!string.IsNullOrEmpty(name.monitorDevicePath) &&
+                name.monitorDevicePath.IndexOf(devicePathSubstring, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                primarySourceModeIdx = (int)paths[i].sourceInfo.modeInfoIdx;
+                break;
+            }
+        }
+
+        if (primarySourceModeIdx < 0 || primarySourceModeIdx >= modes.Length)
+            throw new InvalidOperationException($"No active target matched device path containing '{devicePathSubstring}'.");
+
+        if (modes[primarySourceModeIdx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            throw new InvalidOperationException("Matched path does not have a valid source mode.");
+
+        // The offset needed to move the target display's source position to (0,0)
+        int offsetX = modes[primarySourceModeIdx].u.sourceMode.position.x;
+        int offsetY = modes[primarySourceModeIdx].u.sourceMode.position.y;
+
+        // Shift all source modes by the offset so the target becomes (0,0)
+        for (int i = 0; i < modes.Length; i++)
+        {
+            if (modes[i].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                modes[i].u.sourceMode.position.x -= offsetX;
+                modes[i].u.sourceMode.position.y -= offsetY;
+            }
+        }
 
         ApplySuppliedConfig(paths, modes);
     }
@@ -295,6 +472,77 @@ public static class CcdDisplaySwitcher
         return rc == 0;
     }
 
+    private static void Log(string message)
+    {
+        Trace.WriteLine(message);
+        Console.Error.WriteLine(message);
+    }
+
+    /// <summary>
+    /// Shift all source mode positions so that the top-left of the active desktop is at (0,0).
+    /// MSDN requires (0,0) to be covered by at least one active source.
+    /// </summary>
+    private static void NormalizeSourcePositions(DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
+    {
+        int minX = int.MaxValue, minY = int.MaxValue;
+        for (int i = 0; i < paths.Length; i++)
+        {
+            if ((paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE) == 0) continue;
+            uint si = paths[i].sourceInfo.modeInfoIdx;
+            if (si >= (uint)modes.Length) continue;
+            if (modes[si].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) continue;
+            if (modes[si].u.sourceMode.position.x < minX) minX = modes[si].u.sourceMode.position.x;
+            if (modes[si].u.sourceMode.position.y < minY) minY = modes[si].u.sourceMode.position.y;
+        }
+        if (minX == int.MaxValue || (minX == 0 && minY == 0)) return;
+
+        Log($"NormalizeSourcePositions: shifting by ({-minX},{-minY})");
+        for (int i = 0; i < modes.Length; i++)
+        {
+            if (modes[i].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                modes[i].u.sourceMode.position.x -= minX;
+                modes[i].u.sourceMode.position.y -= minY;
+            }
+        }
+    }
+
+    private static void DumpConfig(string label, DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
+    {
+        Log($"\n=== {label} === paths={paths.Length} modes={modes.Length}");
+        for (int i = 0; i < paths.Length; i++)
+        {
+            var p = paths[i];
+            bool active = (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
+            TryGetTargetName(p.targetInfo.adapterId, p.targetInfo.id, out var name);
+            Log($"  Path[{i}]: active={active} srcId={p.sourceInfo.id} srcModeIdx={p.sourceInfo.modeInfoIdx:X8} srcStatus={p.sourceInfo.statusFlags:X8}"
+                + $" tgtId={p.targetInfo.id} tgtModeIdx={p.targetInfo.modeInfoIdx:X8}"
+                + $" outTech={p.targetInfo.outputTechnology} rot={p.targetInfo.rotation} scl={p.targetInfo.scaling}"
+                + $" refresh={p.targetInfo.refreshRate.Numerator}/{p.targetInfo.refreshRate.Denominator}"
+                + $" scanLine={p.targetInfo.scanLineOrdering} avail={p.targetInfo.targetAvailable} tgtStatus={p.targetInfo.statusFlags:X8}"
+                + $" flags={p.flags:X8}"
+                + $" name={name.monitorFriendlyDeviceName}");
+        }
+        for (int i = 0; i < modes.Length; i++)
+        {
+            var m = modes[i];
+            if (m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                var s = m.u.sourceMode;
+                Log($"  Mode[{i}]: SOURCE id={m.id} {s.width}x{s.height} fmt={s.pixelFormat} pos=({s.position.x},{s.position.y})");
+            }
+            else if (m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+            {
+                var t = m.u.targetMode.targetVideoSignalInfo;
+                Log($"  Mode[{i}]: TARGET id={m.id} active={t.activeSize.cx}x{t.activeSize.cy} total={t.totalSize.cx}x{t.totalSize.cy} pixRate={t.pixelRate} vsync={t.vSyncFreq.Numerator}/{t.vSyncFreq.Denominator}");
+            }
+            else
+            {
+                Log($"  Mode[{i}]: type={m.infoType} id={m.id}");
+            }
+        }
+    }
+
     private static void ApplySuppliedConfig(DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)
     {
         var hPaths = GCHandle.Alloc(paths, GCHandleType.Pinned);
@@ -304,13 +552,19 @@ public static class CcdDisplaySwitcher
             IntPtr pPaths = hPaths.AddrOfPinnedObject();
             IntPtr pModes = hModes.AddrOfPinnedObject();
 
+            DumpConfig("ApplySuppliedConfig", paths, modes);
+
             // SetDisplayConfig applies only paths that are marked active when using supplied config. [1](https://learn.microsoft.com/en-us/answers/questions/3983440/disable-one-monitor-on-three-monitor-setups)
             int rc = SetDisplayConfig(
                 (uint)paths.Length, pPaths,
                 (uint)modes.Length, pModes,
                 SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
 
-            if (rc != 0) throw new System.ComponentModel.Win32Exception(rc);
+            if (rc != 0)
+            {
+                Log($"SetDisplayConfig FAILED: rc={rc} (0x{rc:X8})");
+                throw new System.ComponentModel.Win32Exception(rc);
+            }
         }
         finally
         {
@@ -320,6 +574,9 @@ public static class CcdDisplaySwitcher
     }
     public static void EnableOnlyByTargetDevicePathSubstring(string needle)
     {
+        // Ensure all connected displays are active so we can find them all
+        EnableAllExtended();
+
         var (paths, modes) = GetConfig(QDC_ONLY_ACTIVE_PATHS);
 
         bool anyKept = false;
@@ -354,24 +611,87 @@ public static class CcdDisplaySwitcher
         if (!anyKept)
             throw new InvalidOperationException($"No target matched device path containing '{needle}'.");
 
+        NormalizeSourcePositions(paths, modes);
         ApplySuppliedConfig(paths, modes);
     }
-    public static int Main(string[] args)
+    private static void PrintUsage()
     {
-        CcdDisplaySwitcher.ListTargets();
-        EnableOnlyByTargetDevicePathSubstring("UID8517");
+        Console.WriteLine("Usage: MyDisplaySwitch <command> [args]");
+        Console.WriteLine();
+        Console.WriteLine("Commands:");
+        Console.WriteLine("  list                          List all active display targets");
+        Console.WriteLine("  extend                        Enable all displays in extended mode");
+        Console.WriteLine("  only <devicePathSubstring>    Enable only the display whose device path contains the substring");
+        Console.WriteLine("  primary <devicePathSubstring> Set the primary display to the one whose device path contains the substring");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  MyDisplaySwitch list");
+        Console.WriteLine("  MyDisplaySwitch extend");
+        Console.WriteLine("  MyDisplaySwitch only UID8517");
+        Console.WriteLine("  MyDisplaySwitch primary UID8388688");
 
-        /*
+    }
+    /*
 Targets:
   Path#0:   [\\?\DISPLAY#SDC4187#4&1a73ae31&0&UID8388688#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}]
   Path#1: DELL U2717D  [\\?\DISPLAY#DEL40EA#4&1a73ae31&0&UID4165#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}]
-  Path#2: DELL U2717D  [\\?\DISPLAY#DEL40EA#4&1a73ae31&0&UID8517#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}]         
-         */
-        return 0;
+  Path#2: DELL U2717D  [\\?\DISPLAY#DEL40EA#4&1a73ae31&0&UID8517#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}]     
+     */
+    public static int Main(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            PrintUsage();
+            return 1;
+        }
 
+        try
+        {
+            switch (args[0].ToLowerInvariant())
+            {
+                case "list":
+                    ListTargets();
+                    break;
+
+                case "extend":
+                    EnableAllExtended();
+                    Console.WriteLine("All displays enabled in extended mode.");
+                    break;
+
+                case "only":
+                    if (args.Length < 2)
+                    {
+                        Console.Error.WriteLine("Error: 'only' requires a device path substring argument.");
+                        PrintUsage();
+                        return 1;
+                    }
+                    EnableOnlyByTargetDevicePathSubstring(args[1]);
+                    Console.WriteLine($"Enabled only display matching '{args[1]}'.");
+                    break;
+
+                case "primary":
+                    if (args.Length < 2)
+                    {
+                        Console.Error.WriteLine("Error: 'primary' requires a device path substring argument.");
+                        PrintUsage();
+                        return 1;
+                    }
+                    SetPrimary(args[1]);
+                    Console.WriteLine($"Set primary display to the one matching '{args[1]}'.");
+                    break;
+
+                default:
+                    Console.Error.WriteLine($"Unknown command: {args[0]}");
+                    PrintUsage();
+                    return 1;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return 2;
+        }
+
+        return 0;
     }
 }
-
-// Example usage:
-// CcdDisplaySwitcher.ListTargets();
-// CcdDisplaySwitcher.EnableOnly("DELL"); // or "LG", "U2720Q", etc.
